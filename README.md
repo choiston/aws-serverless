@@ -18,24 +18,751 @@
 
 ## 목차
 
-1. [기술 스택](#기술-스택)
-2. [아키텍처](#아키텍처)
+1. [사전 지식: API · REST API · CORS](#사전-지식-api--rest-api--cors)
+   - [API란?](#1-apiapplication-programming-interface란)
+   - [REST API란?](#2-rest-api란)
+   - [CORS란?](#3-corscross-origin-resource-sharing란)
+   - [SSL/TLS와 HTTPS, 로드밸런서 연동](#4-api-보안을-위한-ssltls와-https)
+2. [기술 스택](#기술-스택)
+3. [아키텍처](#아키텍처)
    - [주가 데이터 AI/ML 파이프라인](#주가-데이터-aiml-파이프라인-stock-pipeline)
    - [API Gateway + Lambda](#api-gateway--lambda-hello-api)
    - [S3 이벤트 트리거 + Lambda](#s3-이벤트-트리거--lambda)
    - [GitHub Actions 배포 파이프라인](#github-actions-배포-파이프라인)
-3. [디렉터리 구조](#디렉터리-구조)
-4. [사전 준비](#사전-준비)
-5. [AWS CLI 설치 및 설정](#aws-cli-설치-및-설정)
-6. [AWS Lambda 이해](#aws-lambda-이해)
-7. [Node.js Lambda 배포](#nodejs-lambda-배포)
-8. [Python Lambda 배포](#python-lambda-배포)
-9. [Java Lambda 배포](#java-lambda-배포)
-10. [API Gateway 연동](#api-gateway-연동)
-11. [GitHub Actions CI/CD 자동 배포](#github-actions-cicd-자동-배포)
-12. [권한 오류 해결 가이드](#권한-오류-해결-가이드)
-13. [AWS CLI 명령어 모음](#aws-cli-명령어-모음)
-14. [추가 실습](#추가-실습)
+4. [디렉터리 구조](#디렉터리-구조)
+5. [사전 준비](#사전-준비)
+6. [AWS CLI 설치 및 설정](#aws-cli-설치-및-설정)
+7. [AWS Lambda 이해](#aws-lambda-이해)
+8. [Node.js Lambda 배포](#nodejs-lambda-배포)
+9. [Python Lambda 배포](#python-lambda-배포)
+10. [Java Lambda 배포](#java-lambda-배포)
+11. [API Gateway 연동](#api-gateway-연동)
+12. [GitHub Actions CI/CD 자동 배포](#github-actions-cicd-자동-배포)
+13. [권한 오류 해결 가이드](#권한-오류-해결-가이드)
+14. [AWS CLI 명령어 모음](#aws-cli-명령어-모음)
+15. [추가 실습](#추가-실습)
+
+---
+
+## 사전 지식: API · REST API · CORS
+
+이 레포는 "Lambda 함수를 API Gateway 뒤에 두고 HTTP로 호출한다"는 구조를 반복해서 다룹니다.
+그래서 **API가 무엇인지, REST API 규칙이 무엇인지, 브라우저에서 호출할 때 왜 CORS 오류가 나는지, 왜 HTTPS(SSL/TLS)가 필수이고 로드밸런서와는 어떻게 연결하는지**를 먼저 이해해 두면
+이후 실습 코드(`nodejs/handler.js`, `python/handler.py`, `java/.../HelloHandler.java`, 각 `serverless.yaml`)가 훨씬 쉽게 읽힙니다.
+
+### 1. API(Application Programming Interface)란?
+
+**API는 "프로그램끼리 서로 대화하기 위해 미리 약속한 규칙"** 입니다.
+사람이 카페에서 주문할 때 메뉴판(무엇을 시킬 수 있는지)과 주문 방법(카운터에서 말한다)이 정해져 있듯이,
+프로그램도 "어떤 기능을, 어떤 형식으로 요청하면, 어떤 형식으로 응답이 오는지"를 정해 둔 것이 API입니다.
+
+| 구분 | 예시 | 설명 |
+| ---- | ---- | ---- |
+| 라이브러리 API | `JSON.parse()`, `boto3.client("s3")` | 같은 프로세스 안에서 함수를 호출하는 약속 |
+| 운영체제 API | 파일 열기, 네트워크 소켓 | 프로그램이 OS 기능을 사용하는 약속 |
+| **웹 API** | `GET https://.../dev/hello?name=Alice` | **네트워크(HTTP)를 통해 다른 서버의 기능을 사용하는 약속** — 이 레포가 다루는 것 |
+
+웹 API에서는 항상 두 역할이 등장합니다.
+
+```
+  클라이언트 (요청하는 쪽)                 서버 (응답하는 쪽)
+  브라우저 / curl / Postman / 다른 Lambda   API Gateway + Lambda
+        │                                        │
+        │ ── 요청(Request): 메서드 + URL + 헤더 + 본문 ──▶ │
+        │                                        │
+        │ ◀── 응답(Response): 상태 코드 + 헤더 + 본문 ── │
+```
+
+**요청(Request)** 의 구성 요소
+
+| 요소 | 의미 | 예시 |
+| ---- | ---- | ---- |
+| HTTP 메서드 | 무엇을 하고 싶은지(동사) | `GET`, `POST`, `PUT`, `DELETE` |
+| URL(경로) | 어떤 자원에 대해서인지(명사) | `/users`, `/users/42` |
+| 쿼리 스트링 | URL 뒤에 붙는 부가 조건 | `?name=Alice&limit=10` |
+| 헤더(Header) | 요청에 대한 메타 정보 | `Content-Type: application/json`, `Authorization: Bearer ...` |
+| 본문(Body) | 서버에 보낼 실제 데이터(주로 JSON) | `{"name": "Alice", "email": "a@b.com"}` |
+
+**응답(Response)** 의 구성 요소
+
+| 요소 | 의미 | 예시 |
+| ---- | ---- | ---- |
+| 상태 코드(Status Code) | 처리 결과를 숫자로 요약 | `200 OK`, `201 Created`, `404 Not Found`, `500 Internal Server Error` |
+| 헤더 | 응답에 대한 메타 정보 | `Content-Type: application/json`, `Access-Control-Allow-Origin: *` |
+| 본문 | 실제 응답 데이터 | `{"message": "Hello, Alice!"}` |
+
+Lambda 핸들러가 반환하는 객체가 정확히 이 "응답"의 구조입니다. `python/handler.py`를 보면 다음과 같습니다.
+
+```python
+return {
+    "statusCode": 200,                                  # 상태 코드
+    "headers": {"Content-Type": "application/json"},   # 헤더
+    "body": json.dumps(body),                           # 본문 (반드시 문자열)
+}
+```
+
+즉 **API Gateway는 HTTP 요청을 `event` 객체로 바꿔 Lambda에 넘기고, Lambda가 돌려준 객체를 다시 HTTP 응답으로 바꿔 클라이언트에 전달**하는 번역기 역할을 합니다. 이 구조를 "Lambda Proxy 통합"이라고 부르며, 자세한 event / response 형태는 [AWS Lambda 이해](#aws-lambda-이해) 절에서 다룹니다.
+
+### 2. REST API란?
+
+REST(Representational State Transfer)는 웹 API를 설계할 때 널리 쓰이는 **설계 스타일(규칙 모음)** 입니다.
+"어떤 형식으로 요청하면 되는지"를 팀마다 새로 정하지 않아도 되도록, HTTP가 원래 가진 의미를 최대한 그대로 활용합니다.
+REST 규칙을 따르는 API를 **REST API** 또는 **RESTful API**라고 부릅니다.
+
+#### 핵심 원칙 4가지
+
+**① 자원(Resource)은 URL로, 행위(Action)는 HTTP 메서드로 표현한다**
+
+URL에는 동사를 쓰지 않고 **명사(자원 이름)** 만 씁니다. "무엇을 할지"는 메서드가 결정합니다.
+
+| 하고 싶은 일 | ❌ REST답지 않은 설계 | ✅ REST 설계 |
+| ---- | ---- | ---- |
+| 사용자 목록 조회 | `GET /getUsers` | `GET /users` |
+| 사용자 생성 | `POST /createUser` | `POST /users` |
+| 42번 사용자 조회 | `GET /getUser?id=42` | `GET /users/42` |
+| 42번 사용자 수정 | `POST /updateUser?id=42` | `PUT /users/42` |
+| 42번 사용자 삭제 | `GET /deleteUser?id=42` | `DELETE /users/42` |
+
+**② HTTP 메서드는 정해진 의미대로 사용한다 (CRUD 매핑)**
+
+| 메서드 | CRUD | 의미 | 멱등성* | 본문 |
+| ---- | ---- | ---- | ---- | ---- |
+| `GET` | Read | 자원 조회. 서버 상태를 바꾸지 않음 | O | 없음 |
+| `POST` | Create | 새 자원 생성. 호출할 때마다 새로 만들어짐 | X | 있음 |
+| `PUT` | Update | 자원 전체 교체(없으면 생성하기도 함) | O | 있음 |
+| `PATCH` | Update | 자원 일부만 수정 | △ | 있음 |
+| `DELETE` | Delete | 자원 삭제 | O | 보통 없음 |
+| `OPTIONS` | — | "이 URL은 어떤 메서드/헤더를 허용하나요?" 질의. **CORS 사전 요청에 사용** | O | 없음 |
+
+\* 멱등성(Idempotent): 같은 요청을 여러 번 보내도 결과가 한 번 보낸 것과 같은 성질. 네트워크 오류 시 재시도해도 안전한지 판단하는 기준입니다.
+
+**③ 상태 코드로 결과를 알린다**
+
+| 범위 | 의미 | 자주 쓰는 코드 |
+| ---- | ---- | ---- |
+| 2xx | 성공 | `200 OK`(조회·수정 성공), `201 Created`(생성 성공), `204 No Content`(삭제 성공, 본문 없음) |
+| 4xx | 클라이언트 잘못 | `400 Bad Request`(입력값 오류), `401 Unauthorized`(인증 없음), `403 Forbidden`(권한 없음), `404 Not Found`(자원 없음) |
+| 5xx | 서버 잘못 | `500 Internal Server Error`(코드 예외), `502 Bad Gateway`(Lambda 응답 형식 오류 시 API Gateway가 반환), `504 Gateway Timeout`(Lambda 타임아웃) |
+
+> 💡 Lambda에서 응답 객체 형식이 잘못되면(예: `body`가 문자열이 아닐 때) API Gateway는 `502 Bad Gateway`를 돌려줍니다. 실습 중 502가 보이면 Lambda 코드의 반환값부터 확인하세요.
+
+**④ 무상태(Stateless)**
+
+서버는 이전 요청을 기억하지 않습니다. 매 요청은 그 자체로 처리에 필요한 모든 정보(인증 토큰, 파라미터 등)를 담아야 합니다.
+이 원칙 덕분에 Lambda처럼 **요청마다 다른 인스턴스에서 실행되는** 환경에서도 REST API가 자연스럽게 동작합니다.
+
+#### 이 레포의 REST API 예시 (`nodejs/serverless.yaml` → `usersApi`)
+
+```
+GET    /users          → 사용자 목록 조회
+POST   /users          → 사용자 생성       (본문: {"name": "...", "email": "..."})
+GET    /users/{id}     → 특정 사용자 조회
+PUT    /users/{id}     → 특정 사용자 수정
+DELETE /users/{id}     → 특정 사용자 삭제
+```
+
+`{id}` 처럼 중괄호로 감싼 부분을 **경로 파라미터(Path Parameter)** 라고 하며, Lambda에서는 `event.pathParameters.id`로 읽습니다.
+쿼리 스트링(`?name=Alice`)은 `event.queryStringParameters.name`, 본문은 `event.body`(JSON 문자열)로 전달됩니다.
+
+`curl`로 직접 호출해 보면 이렇게 됩니다.
+
+```bash
+# 조회 (GET, 본문 없음)
+curl https://<api-id>.execute-api.ap-northeast-2.amazonaws.com/dev/users/42
+
+# 생성 (POST, JSON 본문 + Content-Type 헤더)
+curl -X POST https://<api-id>.execute-api.ap-northeast-2.amazonaws.com/dev/users \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Alice", "email": "alice@example.com"}'
+
+# 삭제 (DELETE)
+curl -X DELETE https://<api-id>.execute-api.ap-northeast-2.amazonaws.com/dev/users/42
+```
+
+#### API Gateway의 "REST API"와 "HTTP API"
+
+AWS API Gateway에는 두 종류의 API 유형이 있어 이름이 헷갈리기 쉽습니다.
+
+| 유형 | 설명 | 이 레포 |
+| ---- | ---- | ---- |
+| **REST API** (v1) | 기능이 많고(사용량 계획, 요청 검증, WAF 등) 설정이 세밀함. Serverless Framework의 `events: - http:` | ✅ 사용 |
+| **HTTP API** (v2) | 더 가볍고 저렴하며 지연이 낮음. Serverless Framework의 `events: - httpApi:` | 미사용 |
+
+여기서 "REST API"는 AWS의 상품명이며, 위에서 설명한 REST 설계 원칙과는 별개입니다. 두 유형 모두 REST 스타일로 설계할 수 있습니다.
+
+### 3. CORS(Cross-Origin Resource Sharing)란?
+
+실습 중 가장 자주 만나는 오류가 바로 이것입니다.
+
+```
+Access to fetch at 'https://abc123.execute-api.ap-northeast-2.amazonaws.com/dev/hello'
+from origin 'http://localhost:3000' has been blocked by CORS policy:
+No 'Access-Control-Allow-Origin' header is present on the requested resource.
+```
+
+`curl`이나 Postman으로는 잘 되는데 **브라우저의 JavaScript(`fetch`, `axios`)로 호출하면 실패**한다면 거의 100% CORS 문제입니다.
+
+#### 3-1. 출처(Origin)란?
+
+**출처 = 프로토콜 + 호스트(도메인) + 포트** 세 가지의 조합입니다. 하나라도 다르면 "다른 출처(Cross-Origin)"입니다.
+
+| URL | `http://localhost:3000`과 같은 출처인가? | 이유 |
+| ---- | ---- | ---- |
+| `http://localhost:3000/page.html` | ✅ 같음 | 경로만 다름 |
+| `https://localhost:3000` | ❌ 다름 | 프로토콜(http ≠ https) |
+| `http://localhost:8080` | ❌ 다름 | 포트(3000 ≠ 8080) |
+| `http://127.0.0.1:3000` | ❌ 다름 | 호스트(localhost ≠ 127.0.0.1) |
+| `https://abc123.execute-api.ap-northeast-2.amazonaws.com` | ❌ 다름 | 전부 다름 |
+
+#### 3-2. 왜 브라우저가 막는가? — 동일 출처 정책(Same-Origin Policy)
+
+브라우저에는 **"웹 페이지의 스크립트는 자기 출처의 자원만 읽을 수 있다"** 는 보안 규칙이 기본으로 켜져 있습니다.
+이것이 없다면, 악성 사이트 `evil.com`의 스크립트가 여러분이 로그인해 둔 `bank.com`의 API를 몰래 호출해 계좌 정보를 읽어갈 수 있습니다.
+
+그런데 정상적인 서비스에서도 프론트엔드(`localhost:3000` 또는 `myapp.com`)와 백엔드 API(`xxx.execute-api.amazonaws.com`)의 출처가 다른 경우가 대부분입니다.
+그래서 **"서버가 명시적으로 허락한 출처에 한해 브라우저가 예외를 허용하는 방법"** 이 필요하고, 그 표준이 CORS입니다.
+
+핵심을 정리하면 다음과 같습니다.
+
+- CORS 검사는 **브라우저만** 수행합니다. `curl`, Postman, 서버 간 호출, Lambda → Lambda 호출에는 CORS가 전혀 관여하지 않습니다.
+- 요청은 실제로 서버까지 도달하고 Lambda도 실행됩니다. 다만 **응답이 돌아온 뒤 브라우저가 응답 헤더를 검사해서 JavaScript에 넘겨줄지 말지를 결정**합니다.
+- 허락 여부는 **서버가 응답 헤더로** 알려줍니다. 따라서 CORS 오류는 프론트엔드 코드가 아니라 **서버(Lambda / API Gateway) 쪽 설정**으로 해결합니다.
+
+#### 3-3. 동작 방식
+
+**(A) 단순 요청(Simple Request)** — `GET`, `HEAD`, 또는 `Content-Type`이 폼 형식인 `POST`이고 커스텀 헤더가 없는 경우
+
+```
+브라우저 (localhost:3000)                          API Gateway + Lambda
+      │                                                    │
+      │ ── GET /dev/hello  (Origin: http://localhost:3000) ──▶ │
+      │                                                    │  Lambda 실행
+      │ ◀── 200 OK                                        │
+      │     Access-Control-Allow-Origin: *   ◀── 이 헤더가 있어야 JS가 응답을 읽을 수 있음
+      │     {"message": "Hello, Alice!"}                  │
+```
+
+브라우저는 요청에 `Origin` 헤더를 자동으로 붙여 보내고, 응답의 `Access-Control-Allow-Origin` 값이 `*` 이거나 자신의 출처와 일치하면 응답을 JavaScript에 전달합니다. 헤더가 없으면 위의 오류를 냅니다.
+
+**(B) 사전 요청(Preflight Request)** — `PUT`, `DELETE`, `PATCH`, 또는 `Content-Type: application/json`인 `POST`, 또는 `Authorization` 같은 커스텀 헤더가 있는 경우
+
+브라우저는 실제 요청을 보내기 **전에** `OPTIONS` 메서드로 "이런 요청 보내도 되나요?"라고 먼저 물어봅니다.
+
+```
+브라우저 (localhost:3000)                          API Gateway
+      │                                                    │
+      │ ── ① OPTIONS /dev/users  ────────────────────────▶ │  ← 사전 요청 (Lambda 미실행)
+      │       Origin: http://localhost:3000                │
+      │       Access-Control-Request-Method: POST          │
+      │       Access-Control-Request-Headers: content-type │
+      │                                                    │
+      │ ◀── ② 200 OK  ─────────────────────────────────── │  ← API Gateway가 MOCK 통합으로 응답
+      │       Access-Control-Allow-Origin: *               │
+      │       Access-Control-Allow-Methods: GET,POST,PUT,DELETE,OPTIONS
+      │       Access-Control-Allow-Headers: Content-Type,Authorization,...
+      │                                                    │
+      │ ── ③ POST /dev/users  (실제 요청) ────────────────▶ │  → Lambda 실행
+      │       Content-Type: application/json               │
+      │       {"name": "Alice"}                            │
+      │                                                    │
+      │ ◀── ④ 201 Created                                  │
+      │       Access-Control-Allow-Origin: *  ◀── 실제 응답에도 헤더 필요
+```
+
+> ⚠️ 흔한 함정: **사전 요청(①②)과 실제 응답(④) 양쪽 모두** CORS 헤더가 있어야 합니다. `OPTIONS`는 API Gateway가 처리하고, 실제 응답 헤더는 Lambda 코드가 직접 넣어야 하므로 **두 군데를 모두 설정**해야 합니다.
+
+#### 3-4. CORS 관련 응답 헤더 정리
+
+| 헤더 | 의미 | 예시 값 |
+| ---- | ---- | ---- |
+| `Access-Control-Allow-Origin` | 허용할 출처. `*`는 모든 출처 허용 | `*` 또는 `https://myapp.com` |
+| `Access-Control-Allow-Methods` | 허용할 HTTP 메서드 (사전 요청 응답용) | `GET,POST,PUT,DELETE,OPTIONS` |
+| `Access-Control-Allow-Headers` | 클라이언트가 보내도 되는 헤더 (사전 요청 응답용) | `Content-Type,Authorization` |
+| `Access-Control-Allow-Credentials` | 쿠키·인증 정보 포함 허용. `true`일 때는 Origin에 `*`를 쓸 수 없음 | `true` |
+| `Access-Control-Max-Age` | 사전 요청 결과를 브라우저가 캐시할 초 단위 시간 | `86400` |
+
+#### 3-5. 이 레포에서 CORS가 설정된 위치
+
+**① API Gateway 쪽 (사전 요청 OPTIONS 처리)** — 각 `serverless.yaml`의 `cors: true`
+
+```yaml
+functions:
+  usersApi:
+    handler: handler.usersApi
+    events:
+      - http:
+          path: users
+          method: post
+          cors: true      # ← OPTIONS 메서드와 CORS 응답 헤더를 API Gateway에 자동 생성
+```
+
+`cors: true` 한 줄이면 Serverless Framework가 해당 경로에 `OPTIONS` 메서드(MOCK 통합)를 추가하고
+`Access-Control-Allow-Origin: *`, `Allow-Methods`, `Allow-Headers`를 포함한 사전 요청 응답을 구성해 줍니다.
+허용 출처를 제한하려면 다음과 같이 객체 형태로 적습니다.
+
+```yaml
+      - http:
+          path: users
+          method: post
+          cors:
+            origin: "https://myapp.com"
+            headers:
+              - Content-Type
+              - Authorization
+            allowCredentials: false
+```
+
+**② Lambda 쪽 (실제 응답에 헤더 삽입)** — `nodejs/handler.js`의 `response()` 헬퍼
+
+```js
+function response(statusCode, body) {
+  return {
+    statusCode,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",                       // ← 실제 응답용 CORS 헤더
+      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
+    },
+    body: JSON.stringify(body),
+  };
+}
+```
+
+Java의 `HelloHandler.java`도 동일하게 `headers.put("Access-Control-Allow-Origin", "*")`를 넣고 있습니다.
+반면 `python/handler.py`의 기본 `hello` 함수는 `Content-Type`만 반환하므로, 브라우저에서 호출하려면 아래처럼 헤더를 추가해야 합니다.
+
+```python
+return {
+    "statusCode": 200,
+    "headers": {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",   # ← 추가
+    },
+    "body": json.dumps(body),
+}
+```
+
+**③ AWS 콘솔 / CLI로 직접 API Gateway를 만든 경우**
+
+콘솔에서 리소스를 선택한 뒤 **"CORS 활성화"** 버튼을 누르면 ①과 같은 OPTIONS 메서드가 생성됩니다.
+단, 이 작업 후에는 반드시 **API를 스테이지에 다시 배포**해야 반영됩니다. ("설정은 했는데 여전히 CORS 오류"의 가장 흔한 원인)
+
+#### 3-6. CORS 오류 체크리스트
+
+| 증상 | 확인할 것 |
+| ---- | ---- |
+| `curl`은 되는데 브라우저만 안 됨 | CORS 문제 맞음. 아래 항목 순서대로 확인 |
+| `No 'Access-Control-Allow-Origin' header` | Lambda 응답 `headers`에 `Access-Control-Allow-Origin` 넣었는지 |
+| `Response to preflight request doesn't pass` | `serverless.yaml`에 `cors: true` 있는지 / 콘솔에서 CORS 활성화 후 재배포했는지 |
+| `Method OPTIONS is not allowed` | 해당 경로에 OPTIONS 메서드가 없음. `cors: true` 추가 후 `serverless deploy` |
+| 500 에러인데 CORS 오류로 보임 | Lambda가 예외로 죽으면 헤더 없이 응답되어 CORS 오류처럼 보임. CloudWatch 로그 먼저 확인 |
+| 인증 쿠키가 안 넘어감 | `Allow-Credentials: true` + `Allow-Origin`에 `*` 대신 구체적 출처 지정 + 클라이언트 `credentials: "include"` |
+
+> 🔒 **운영 환경 권고**: 실습에서는 편의상 `Access-Control-Allow-Origin: *`를 사용하지만, 실제 서비스에서는 프론트엔드의 정확한 출처(예: `https://myapp.com`)만 허용하세요.
+
+### 4. API 보안을 위한 SSL/TLS와 HTTPS
+
+CORS가 "브라우저가 누구의 요청을 허용할지"에 관한 것이라면, SSL/TLS는 **"오가는 데이터를 중간에서 누가 훔쳐보거나 바꾸지 못하게 하는 것"** 에 관한 것입니다.
+API를 인터넷에 공개하는 순간 이 두 가지는 함께 고려해야 합니다.
+
+#### 4-1. 왜 HTTP가 아니라 HTTPS여야 하는가?
+
+HTTP는 요청과 응답을 **평문(plain text)** 으로 보냅니다. 같은 Wi-Fi에 있는 사람, ISP, 중간 라우터 어디서든 내용을 그대로 볼 수 있습니다.
+
+```
+[HTTP]  브라우저 ──── POST /users {"email":"alice@x.com","password":"1234"} ────▶ 서버
+                         ▲ 카페 Wi-Fi, 통신사, 프록시 … 누구나 읽고 바꿀 수 있음
+
+[HTTPS] 브라우저 ──── 8f3a9c…(암호화된 바이트) ──────────────────────────────▶ 서버
+                         ▲ 내용을 읽을 수도, 바꿀 수도, 서버를 사칭할 수도 없음
+```
+
+SSL/TLS(Secure Sockets Layer / Transport Layer Security)는 HTTP 아래에 깔려 다음 세 가지를 보장합니다. SSL은 옛 이름이고 현재 실제로 쓰이는 프로토콜은 **TLS 1.2 / 1.3** 이지만, 관용적으로 "SSL 인증서"라고 부릅니다.
+
+| 보장 | 의미 | 없으면 생기는 문제 |
+| ---- | ---- | ---- |
+| **기밀성(Confidentiality)** | 본문·헤더·쿼리 스트링이 암호화됨 | 비밀번호, API 키, `Authorization` 토큰 유출 |
+| **무결성(Integrity)** | 전송 중 데이터가 바뀌면 즉시 감지됨 | 응답 JSON에 악성 스크립트 삽입, 결제 금액 변조 |
+| **서버 인증(Authentication)** | 접속한 서버가 진짜 `api.myapp.com`인지 인증서로 검증 | 가짜 서버로 유도하는 중간자(MITM) 공격, 피싱 |
+
+API 관점에서 HTTPS가 특히 중요한 이유는 다음과 같습니다.
+
+- **인증 토큰이 헤더에 실린다.** `Authorization: Bearer eyJ...` 는 이 값만 있으면 누구나 그 사용자인 척할 수 있습니다. HTTP로 보내면 토큰이 그대로 노출됩니다.
+- **쿼리 스트링도 노출된다.** `GET /users?apiKey=abcd1234` 같은 요청은 HTTP에서는 URL 전체가 평문입니다. HTTPS에서는 호스트 이름만 보이고 경로·쿼리는 암호화됩니다.
+- **브라우저 기능 제약.** 최신 브라우저는 HTTP 페이지에서 Geolocation, Service Worker, 카메라 등 다수의 API를 차단하고, HTTPS 페이지에서 HTTP API를 호출하면 **혼합 콘텐츠(Mixed Content)** 로 막습니다. 즉 프론트엔드가 HTTPS면 백엔드 API도 반드시 HTTPS여야 합니다.
+- **HTTP/2, HTTP/3는 사실상 HTTPS 전용.** 성능 향상도 TLS 위에서만 얻을 수 있습니다.
+
+#### 4-2. TLS 동작 원리 요약
+
+TLS는 접속 초기에 **핸드셰이크(handshake)** 로 서버를 검증하고 세션 키를 합의한 뒤, 이후 모든 데이터를 그 키로 대칭 암호화합니다.
+
+```
+브라우저                                                      서버 (api.myapp.com)
+   │                                                               │
+   │ ── ① ClientHello: 지원하는 TLS 버전·암호 스위트 목록 ────────▶ │
+   │                                                               │
+   │ ◀── ② ServerHello + 인증서(공개키 포함, CA가 서명) ────────── │
+   │                                                               │
+   │  ③ 인증서 검증                                                │
+   │     · 도메인 이름이 api.myapp.com과 일치하는가?               │
+   │     · 유효 기간 안인가?                                       │
+   │     · 신뢰하는 CA(인증 기관)의 서명인가? (OS/브라우저 내장 목록) │
+   │                                                               │
+   │ ── ④ 키 교환(ECDHE): 양쪽이 같은 세션 키를 계산 ─────────────▶ │
+   │                                                               │
+   │ ═══ ⑤ 이후 HTTP 요청/응답은 세션 키로 대칭 암호화 ═══════════ │
+```
+
+핵심 용어
+
+| 용어 | 설명 |
+| ---- | ---- |
+| **인증서(Certificate)** | "이 공개키는 `api.myapp.com`의 것이다"라고 CA가 서명한 파일. 도메인 이름, 공개키, 유효 기간, 발급자 포함 |
+| **CA(Certificate Authority)** | 인증서를 발급·서명하는 신뢰 기관. Let's Encrypt, DigiCert, **Amazon(ACM)** 등 |
+| **인증서 체인** | 서버 인증서 → 중간 CA → 루트 CA 순으로 서명이 이어짐. 브라우저는 루트 CA 목록을 내장하고 있어 체인을 따라 검증 |
+| **TLS 종료(TLS Termination)** | 암호화를 풀어주는 지점. API Gateway·ALB·CloudFront가 이 역할을 대신하므로 **Lambda 코드는 암호화를 전혀 신경 쓰지 않아도 됨** |
+| **ACM(AWS Certificate Manager)** | AWS가 무료로 공개 인증서를 발급·자동 갱신해 주는 서비스. API Gateway, ALB, CloudFront에 바로 연결 가능 (EC2에는 직접 설치 불가) |
+
+> 💡 실습에서 "SSL 인증서를 사야 하나?"라는 질문이 자주 나옵니다. AWS 관리형 서비스(API Gateway, ALB, CloudFront)에 붙일 인증서는 **ACM에서 무료**이며 갱신도 자동입니다. 필요한 것은 **본인 소유의 도메인** 뿐입니다.
+
+#### 4-3. API Gateway는 기본적으로 HTTPS 전용이다
+
+API Gateway가 만들어 주는 기본 엔드포인트는 **HTTP를 아예 받지 않습니다.** 아래처럼 호출하면 연결 자체가 거부됩니다.
+
+```bash
+# HTTPS — 정상
+curl https://abc123.execute-api.ap-northeast-2.amazonaws.com/dev/hello
+
+# HTTP — 연결 거부 (API Gateway는 80번 포트를 열지 않음)
+curl http://abc123.execute-api.ap-northeast-2.amazonaws.com/dev/hello
+# curl: (7) Failed to connect ... port 80
+```
+
+`*.execute-api.amazonaws.com` 도메인에 대한 인증서는 AWS가 관리하므로, 실습용으로는 **아무 설정 없이 이미 HTTPS가 적용된 상태**입니다.
+다만 운영 환경에서는 다음 이유로 **사용자 지정 도메인(Custom Domain)** 을 붙이는 것이 일반적입니다.
+
+- `abc123.execute-api...` 대신 `api.myapp.com` 같은 읽기 쉬운 주소 사용
+- API를 다시 만들어 ID가 바뀌어도 클라이언트 주소는 유지
+- CORS `Allow-Origin`, 쿠키 도메인 등을 자사 도메인 기준으로 정리
+- TLS 최소 버전(`TLS_1_2`) 정책 지정, 인증서 직접 관리
+
+**사용자 지정 도메인 연결 절차 (AWS CLI, 리전 엔드포인트 기준)**
+
+```bash
+# ① ACM에서 인증서 요청 (REGIONAL API는 API와 같은 리전, EDGE API는 반드시 us-east-1)
+aws acm request-certificate \
+  --domain-name api.myapp.com \
+  --validation-method DNS \
+  --region ap-northeast-2
+# → 출력된 CNAME 레코드를 Route 53(또는 도메인 등록 업체 DNS)에 추가하면 몇 분 내 ISSUED 상태가 됨
+
+# ② API Gateway에 도메인 등록 + 인증서 연결 + TLS 1.2 이상 강제
+aws apigateway create-domain-name \
+  --domain-name api.myapp.com \
+  --regional-certificate-arn arn:aws:acm:ap-northeast-2:123456789012:certificate/xxxx \
+  --endpoint-configuration types=REGIONAL \
+  --security-policy TLS_1_2 \
+  --region ap-northeast-2
+# → 응답의 regionalDomainName (d-xxxx.execute-api.ap-northeast-2.amazonaws.com) 와
+#    regionalHostedZoneId 를 메모
+
+# ③ 도메인 ↔ API 스테이지 매핑 (api.myapp.com/  →  <rest-api-id>/dev)
+aws apigateway create-base-path-mapping \
+  --domain-name api.myapp.com \
+  --rest-api-id abc123 \
+  --stage dev \
+  --region ap-northeast-2
+
+# ④ Route 53에 ALIAS 레코드 추가: api.myapp.com → regionalDomainName
+aws route53 change-resource-record-sets \
+  --hosted-zone-id Z0123456789ABC \
+  --change-batch '{
+    "Changes": [{
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "api.myapp.com",
+        "Type": "A",
+        "AliasTarget": {
+          "HostedZoneId": "<regionalHostedZoneId>",
+          "DNSName": "<regionalDomainName>",
+          "EvaluateTargetHealth": false
+        }
+      }
+    }]
+  }'
+
+# ⑤ 확인
+curl -v https://api.myapp.com/hello?name=Alice 2>&1 | grep -E "SSL connection|subject:|HTTP/"
+```
+
+**Serverless Framework로 자동화** — `serverless-domain-manager` 플러그인을 쓰면 위 ②~④를 `serverless.yaml`에서 선언합니다.
+
+```yaml
+plugins:
+  - serverless-domain-manager
+
+custom:
+  customDomain:
+    domainName: api.myapp.com
+    certificateName: api.myapp.com   # ACM에 발급된 인증서 이름
+    endpointType: regional
+    securityPolicy: tls_1_2
+    basePath: ""
+    stage: ${sls:stage}
+    createRoute53Record: true
+```
+
+```bash
+npm i -D serverless-domain-manager
+sls create_domain      # 도메인·인증서·Route 53 레코드 생성 (최초 1회, 수십 분 소요 가능)
+sls deploy             # 이후 배포마다 base path mapping 자동 갱신
+```
+
+#### 4-4. API Gateway와 HTTPS 로드밸런서를 함께 쓰는 세 가지 패턴
+
+"API Gateway에 로드밸런서를 붙인다"는 말은 실제로는 **어느 쪽이 앞에 서느냐**에 따라 세 가지 다른 구성을 의미합니다.
+먼저 알아둘 제약이 하나 있습니다.
+
+> ⚠️ **ALB는 API Gateway의 공개 엔드포인트를 직접 대상(target)으로 등록할 수 없습니다.** ALB 대상 그룹의 유형은 `instance`, `ip`, `lambda` 세 가지뿐입니다.
+> 따라서 "ALB → API Gateway" 형태를 원한다면 ALB가 API Gateway를 건너뛰고 **Lambda를 직접 호출**하거나(패턴 A), API Gateway 앞에는 ALB 대신 **CloudFront**를 두는 것(패턴 C)이 정석입니다.
+
+| 패턴 | 구성 | 언제 쓰는가 |
+| ---- | ---- | ---- |
+| **A. ALB → Lambda** | API Gateway 없이 ALB가 TLS 종료 + 라우팅 + Lambda 호출 | 이미 ALB 뒤에 EC2/ECS 서비스가 있고, 같은 도메인의 일부 경로만 Lambda로 처리하고 싶을 때. 요청량이 매우 많아 API Gateway 요금이 부담될 때 |
+| **B. API Gateway → VPC Link → NLB/ALB** | API Gateway가 앞, 로드밸런서는 VPC 안 백엔드(EC2/ECS) 앞 | Lambda와 기존 VPC 서비스(Spring Boot, Django 등)를 **하나의 API Gateway 도메인**으로 통합할 때 |
+| **C. CloudFront → API Gateway** | CloudFront가 전 세계 엣지에서 TLS 종료 + 캐시 + WAF | 글로벌 사용자 지연 감소, 응답 캐싱, DDoS/WAF 보호, 정적 사이트(S3)와 API를 같은 도메인으로 묶을 때 |
+
+전체 그림으로 보면 다음과 같습니다.
+
+```
+                    [패턴 A]                       [패턴 B]                        [패턴 C]
+
+  클라이언트 ── HTTPS ──▶ ALB (ACM 인증서)   클라이언트 ── HTTPS ──▶ API Gateway   클라이언트 ── HTTPS ──▶ CloudFront (ACM, WAF)
+                          │ TLS 종료                                │ (ACM)                              │ TLS 종료·캐시
+                          ├─ /api/*  ─▶ Lambda                      ├─ /hello   ─▶ Lambda               ├─ /api/*  ─▶ API Gateway ─▶ Lambda
+                          └─ /*      ─▶ EC2 / ECS                   └─ /legacy/* ─▶ VPC Link ─▶ NLB     └─ /*      ─▶ S3 (정적 사이트)
+                                                                                    └─▶ EC2 / ECS (VPC 내부)
+```
+
+#### 4-5. 패턴 A — ALB(HTTPS 리스너) → Lambda 직접 연결
+
+ALB는 Lambda 함수를 대상 그룹에 등록할 수 있습니다. API Gateway 없이도 HTTPS 엔드포인트가 생기며, 같은 ALB의 다른 경로를 EC2/ECS로 보낼 수 있습니다.
+
+```
+클라이언트 ── https://api.myapp.com/hello ──▶ ALB ── HTTPS 리스너(443, ACM 인증서) ──┐
+                                                  ├── 규칙: path = /hello*  → 대상 그룹(lambda) → hello-nodejs
+                                                  ├── 규칙: path = /*       → 대상 그룹(instance) → EC2
+                                                  └── HTTP 리스너(80) → 443으로 301 리다이렉트
+```
+
+**AWS CLI 절차**
+
+```bash
+# ① Lambda용 대상 그룹 생성 (VPC 지정 불필요)
+aws elbv2 create-target-group \
+  --name hello-lambda-tg \
+  --target-type lambda
+# → TargetGroupArn 메모
+
+# ② ALB가 Lambda를 호출할 수 있도록 리소스 기반 권한 추가
+aws lambda add-permission \
+  --function-name hello-nodejs \
+  --statement-id alb-invoke \
+  --action lambda:InvokeFunction \
+  --principal elasticloadbalancing.amazonaws.com \
+  --source-arn arn:aws:elasticloadbalancing:ap-northeast-2:123456789012:targetgroup/hello-lambda-tg/xxxx
+
+# ③ Lambda를 대상으로 등록
+aws elbv2 register-targets \
+  --target-group-arn arn:aws:elasticloadbalancing:...:targetgroup/hello-lambda-tg/xxxx \
+  --targets Id=arn:aws:lambda:ap-northeast-2:123456789012:function:hello-nodejs
+
+# ④ ALB 생성 (퍼블릭 서브넷 2개 이상, 443 인바운드를 허용한 보안 그룹)
+aws elbv2 create-load-balancer \
+  --name api-alb \
+  --scheme internet-facing \
+  --subnets subnet-aaaa subnet-bbbb \
+  --security-groups sg-xxxx
+# → LoadBalancerArn, DNSName 메모
+
+# ⑤ HTTPS 리스너 생성: ACM 인증서 연결 + TLS 1.2/1.3만 허용
+aws elbv2 create-listener \
+  --load-balancer-arn arn:aws:elasticloadbalancing:...:loadbalancer/app/api-alb/xxxx \
+  --protocol HTTPS --port 443 \
+  --certificates CertificateArn=arn:aws:acm:ap-northeast-2:123456789012:certificate/xxxx \
+  --ssl-policy ELBSecurityPolicy-TLS13-1-2-2021-06 \
+  --default-actions Type=forward,TargetGroupArn=arn:aws:elasticloadbalancing:...:targetgroup/hello-lambda-tg/xxxx
+
+# ⑥ HTTP(80) → HTTPS(443) 강제 리다이렉트 리스너
+aws elbv2 create-listener \
+  --load-balancer-arn arn:aws:elasticloadbalancing:...:loadbalancer/app/api-alb/xxxx \
+  --protocol HTTP --port 80 \
+  --default-actions 'Type=redirect,RedirectConfig={Protocol=HTTPS,Port=443,StatusCode=HTTP_301}'
+
+# ⑦ Route 53: api.myapp.com → ALB DNSName (A ALIAS)
+# ⑧ 확인
+curl -I https://api.myapp.com/hello?name=Alice
+curl -I http://api.myapp.com/hello           # → 301 Location: https://...
+```
+
+**Serverless Framework로 선언** — 이미 존재하는 ALB 리스너에 규칙만 추가합니다.
+
+```yaml
+functions:
+  hello:
+    handler: index.handler
+    events:
+      - alb:
+          listenerArn: arn:aws:elasticloadbalancing:ap-northeast-2:123456789012:listener/app/api-alb/xxxx/yyyy
+          priority: 10
+          conditions:
+            path: /hello
+            method:
+              - GET
+```
+
+**ALB 이벤트는 API Gateway 이벤트와 형식이 조금 다릅니다.** 같은 Lambda를 두 경로로 노출한다면 아래 차이를 처리해야 합니다.
+
+| 항목 | API Gateway (REST, Proxy 통합) | ALB |
+| ---- | ---- | ---- |
+| 요청 구분 | `event.requestContext.apiId` | `event.requestContext.elb.targetGroupArn` |
+| 경로 파라미터 | `event.pathParameters.id` 자동 파싱 | **없음.** `event.path`를 직접 파싱해야 함 |
+| 쿼리 스트링 | `queryStringParameters` | `queryStringParameters` (URL 인코딩된 상태로 전달) |
+| 응답 `statusDescription` | 불필요 | `"200 OK"` 형태로 넣는 것을 권장 |
+| 응답 크기 제한 | 10 MB | **1 MB** |
+| 타임아웃 | 29초 | ALB 유휴 타임아웃(기본 60초) |
+| CORS | `cors: true`로 OPTIONS 자동 생성 | **자동 처리 없음.** Lambda에서 OPTIONS 요청에 직접 응답해야 함 |
+
+`nodejs/handler.js`의 `response()` 헬퍼는 두 경우 모두에서 그대로 동작합니다. ALB에서 CORS 사전 요청을 받으려면 핸들러 앞부분에 다음을 추가하면 됩니다.
+
+```js
+if (event.httpMethod === "OPTIONS") {
+  return response(204, "");   // headers에 Access-Control-Allow-* 가 이미 포함됨
+}
+```
+
+#### 4-6. 패턴 B — API Gateway → VPC Link → NLB/ALB (VPC 내부 백엔드 연결)
+
+Lambda 외에 VPC 안에서 돌고 있는 EC2·ECS 서비스(예: Spring Boot, Django)를 **같은 API Gateway 도메인 아래**에 두고 싶을 때 씁니다.
+API Gateway는 인터넷에서 TLS를 종료하고, VPC Link라는 프라이빗 터널을 통해 VPC 내부 로드밸런서로 요청을 넘깁니다. 백엔드는 인터넷에 노출되지 않습니다.
+
+```
+클라이언트 ── HTTPS ──▶ API Gateway (REST API, ACM)
+                          ├─ GET  /hello          ─▶ Lambda (hello-nodejs)
+                          └─ ANY  /legacy/{proxy+} ─▶ VPC Link ─▶ 내부 NLB ─▶ EC2 / ECS (프라이빗 서브넷)
+                                                       (인터넷 미노출)
+```
+
+| API 유형 | VPC Link가 연결할 수 있는 로드밸런서 |
+| ---- | ---- |
+| REST API (v1) — 이 레포 | **NLB(Network Load Balancer)** 만 가능 |
+| HTTP API (v2) | ALB, NLB, Cloud Map 모두 가능 |
+
+**AWS CLI 절차 (REST API + 내부 NLB)**
+
+```bash
+# ① VPC 내부용 NLB가 이미 있다고 가정 (scheme: internal, 대상: EC2/ECS)
+# ② VPC Link 생성 (수 분 소요, status가 AVAILABLE 될 때까지 대기)
+aws apigateway create-vpc-link \
+  --name legacy-link \
+  --target-arns arn:aws:elasticloadbalancing:ap-northeast-2:123456789012:loadbalancer/net/internal-nlb/xxxx
+# → VpcLinkId 메모
+
+# ③ /legacy/{proxy+} 리소스에 HTTP_PROXY 통합을 VPC_LINK 방식으로 연결
+aws apigateway put-integration \
+  --rest-api-id abc123 \
+  --resource-id <legacy-proxy-resource-id> \
+  --http-method ANY \
+  --type HTTP_PROXY \
+  --integration-http-method ANY \
+  --connection-type VPC_LINK \
+  --connection-id <VpcLinkId> \
+  --uri 'http://internal-nlb-xxxx.elb.ap-northeast-2.amazonaws.com/{proxy}' \
+  --request-parameters '{"integration.request.path.proxy":"method.request.path.proxy"}'
+
+# ④ 스테이지 재배포
+aws apigateway create-deployment --rest-api-id abc123 --stage-name dev
+```
+
+**Serverless Framework로 선언**
+
+```yaml
+functions:
+  hello:
+    handler: index.handler
+    events:
+      - http: { path: hello, method: get, cors: true }
+
+# Lambda 없이 순수 프록시 라우트는 serverless-apigateway-route 계열 플러그인 또는
+# resources 블록(CloudFormation)으로 선언합니다.
+resources:
+  Resources:
+    LegacyVpcLink:
+      Type: AWS::ApiGateway::VpcLink
+      Properties:
+        Name: legacy-link
+        TargetArns:
+          - arn:aws:elasticloadbalancing:ap-northeast-2:123456789012:loadbalancer/net/internal-nlb/xxxx
+```
+
+> 💡 이 구성에서 API Gateway ↔ NLB 구간은 AWS 내부망(PrivateLink)이라 HTTP로 두어도 인터넷에 노출되지 않습니다. 다만 규정상 종단 간 암호화가 필요하면 NLB에 TLS 리스너를 두고 `--uri`를 `https://`로 지정합니다.
+
+#### 4-7. 패턴 C — CloudFront → API Gateway (엣지 HTTPS + 캐시 + WAF)
+
+CloudFront는 전 세계 엣지 로케이션에서 TLS를 종료하는 CDN이며, API Gateway를 오리진(origin)으로 둘 수 있습니다. 로드밸런서는 아니지만 "API Gateway 앞에 HTTPS 계층을 하나 더 두는" 목적으로 가장 흔히 쓰이는 방식입니다.
+
+```
+사용자(서울) ─┐                                  ┌─ /api/*  ─▶ API Gateway (ap-northeast-2) ─▶ Lambda
+사용자(도쿄) ─┼─ HTTPS ─▶ CloudFront (엣지, ACM us-east-1, WAF) ─┤
+사용자(LA)  ─┘            · TLS 종료 · GET 응답 캐시 · 지리 차단      └─ /*      ─▶ S3 (React/Vue 정적 사이트)
+```
+
+장점
+
+- **같은 도메인에서 프론트엔드와 API 제공** → 출처가 같아지므로 **CORS 설정 자체가 불필요**해짐
+- `GET /prices` 같은 읽기 응답을 엣지에 캐시해 Lambda 호출 수와 지연 감소
+- AWS WAF 연결로 SQL 인젝션·봇·Rate Limit 차단, AWS Shield로 DDoS 방어
+- 인증서는 **us-east-1 리전의 ACM**에서 발급해야 함 (CloudFront 제약)
+
+**핵심 설정 (AWS CLI)**
+
+```bash
+# ① us-east-1에 인증서 발급
+aws acm request-certificate --domain-name myapp.com \
+  --subject-alternative-names "*.myapp.com" \
+  --validation-method DNS --region us-east-1
+
+# ② CloudFront 배포 생성 시 오리진과 동작(behavior)을 지정
+#    - 오리진 1: abc123.execute-api.ap-northeast-2.amazonaws.com  (OriginPath: /dev, 프로토콜: https-only)
+#    - 오리진 2: myapp-site.s3.ap-northeast-2.amazonaws.com
+#    - 동작: /api/*  → 오리진 1, 캐시 정책: CachingDisabled(또는 GET만 TTL 부여),
+#            오리진 요청 정책: AllViewerExceptHostHeader  ← Host 헤더를 넘기면 API Gateway가 403 반환
+#    - 동작: /*      → 오리진 2
+#    - ViewerProtocolPolicy: redirect-to-https
+#    - ViewerCertificate: ①의 ACM ARN, MinimumProtocolVersion: TLSv1.2_2021
+aws cloudfront create-distribution --distribution-config file://cf-config.json
+
+# ③ Route 53: myapp.com → CloudFront 도메인(dxxxx.cloudfront.net) A ALIAS
+```
+
+> ⚠️ CloudFront 뒤에 API Gateway를 둘 때 가장 흔한 실수 두 가지: **(1)** 오리진 경로에 스테이지(`/dev`)를 빠뜨려 `{"message":"Missing Authentication Token"}` 발생, **(2)** `Host` 헤더를 그대로 전달해 API Gateway가 `403 Forbidden` 반환. 오리진 요청 정책에서 Host 헤더를 제외해야 합니다.
+
+#### 4-8. HTTPS·로드밸런서 관련 체크리스트
+
+| 상황 | 확인할 것 |
+| ---- | ---- |
+| `curl: (60) SSL certificate problem` | 인증서 도메인과 호출 주소 불일치, 또는 ACM 인증서가 아직 `PENDING_VALIDATION` |
+| 브라우저 "안전하지 않음" 경고 | 자체 서명 인증서 사용 중. ACM 공개 인증서로 교체 |
+| ALB 대상 그룹이 `unhealthy` | Lambda 대상은 상태 검사가 기본 꺼져 있음. Lambda 리소스 권한(`add-permission`)이 빠졌는지 확인 |
+| ALB 경유 시 502 | Lambda 응답에 `statusCode`가 없거나 응답이 1 MB 초과. 또는 `isBase64Encoded` 불일치 |
+| VPC Link 통합 시 504 | NLB 대상 EC2의 보안 그룹이 NLB 서브넷 대역을 허용하지 않음 |
+| CloudFront 경유 시 403 | Host 헤더 전달됨 → 오리진 요청 정책 수정. 또는 API Gateway 리소스 정책이 CloudFront IP를 막음 |
+| CloudFront 경유 시 `Missing Authentication Token` | 오리진 경로에 스테이지 이름(`/dev`) 누락 |
+| HTTP로 호출하면 응답이 없음 | API Gateway는 원래 80번 포트 미지원. ALB/CloudFront에서는 80 → 443 리다이렉트 리스너/정책 추가 |
+| TLS 1.0/1.1 클라이언트 차단하고 싶음 | API GW: `--security-policy TLS_1_2`, ALB: `ELBSecurityPolicy-TLS13-1-2-2021-06`, CloudFront: `TLSv1.2_2021` |
+
+> 🔒 **운영 환경 최소 기준**: (1) 모든 엔드포인트 HTTPS 전용 + HTTP는 301 리다이렉트, (2) TLS 1.2 이상만 허용, (3) ACM 인증서 자동 갱신, (4) `Authorization` 토큰·API 키는 절대 쿼리 스트링에 넣지 않고 헤더로 전달, (5) 인터넷 노출 API에는 WAF 또는 API Gateway 사용량 계획(Usage Plan)으로 Rate Limit 적용.
 
 ---
 
