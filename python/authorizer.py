@@ -1,14 +1,18 @@
-import os
 import json
+import logging
+import os
 
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-# Set AUTH_TOKEN env var on Lambda to override (default: edumgt-secret-token)
-VALID_TOKEN = os.environ.get("AUTH_TOKEN", "edumgt-secret-token")
+# AUTH_TOKEN must be provided via Lambda environment (see serverless.yaml).
+# No default on purpose: if the variable is missing every request is denied.
+VALID_TOKEN = os.environ.get("AUTH_TOKEN", "")
 
 
 def authorize(event, context):
     """
-    Lambda TOKEN Authorizer for the users REST API.
+    Lambda TOKEN Authorizer.
 
     Clients must send:
         Authorization: Bearer <token>
@@ -18,9 +22,14 @@ def authorize(event, context):
     token = _extract_token(event.get("authorizationToken", ""))
     method_arn = event.get("methodArn", "")
 
-    if token == VALID_TOKEN:
+    if not VALID_TOKEN:
+        logger.error("AUTH_TOKEN environment variable is not set; denying all requests")
+        return _policy("user", "Deny", method_arn)
+
+    if token and token == VALID_TOKEN:
         return _policy("user", "Allow", method_arn)
 
+    logger.info("Authorization denied for methodArn=%s", method_arn)
     return _policy("user", "Deny", method_arn)
 
 

@@ -1,5 +1,12 @@
 import json
 
+CORS_HEADERS = {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type,Authorization",
+    "Access-Control-Allow-Methods": "GET,OPTIONS",
+}
+
 
 def hello(event, context):
     """AWS Lambda handler for a simple Hello World HTTP endpoint."""
@@ -10,6 +17,6 @@ def hello(event, context):
 
     return {
         "statusCode": 200,
-        "headers": {"Content-Type": "application/json"},
+        "headers": CORS_HEADERS,
         "body": json.dumps(body),
     }

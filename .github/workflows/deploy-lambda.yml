@@ -105,7 +105,7 @@ jobs:
       - name: Deploy Python Lambda
         run: |
           cd python
-          zip function.zip handler.py
+          zip function.zip handler.py ai_handler.py authorizer.py
           aws lambda update-function-code \
             --function-name ${{ vars.LAMBDA_PYTHON_FUNCTION_NAME }} \
             --zip-file fileb://function.zip \

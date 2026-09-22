@@ -6,11 +6,25 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 
-REGION_NAME = os.environ.get("AWS_REGION") or os.environ.get("AWS_REGION_NAME")
+# Lambda injects AWS_REGION automatically; the fallbacks cover `sls invoke local`.
+REGION_NAME = (
+    os.environ.get("AWS_REGION")
+    or os.environ.get("AWS_DEFAULT_REGION")
+    or "ap-northeast-2"
+)
 DEFAULT_LANGUAGE = os.environ.get("AI_DEFAULT_LANGUAGE", "ko")
 REKOGNITION_MAX_LABELS = int(os.environ.get("REKOGNITION_MAX_LABELS", "10"))
 REKOGNITION_MIN_CONFIDENCE = float(os.environ.get("REKOGNITION_MIN_CONFIDENCE", "80"))
+# Comprehend DetectPiiEntities only supports English and Spanish.
+# With the default language "ko", pass "language_code": "en" to get PII results.
 PII_SUPPORTED_LANGUAGES = {"en", "es"}
+
+CORS_HEADERS = {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type,Authorization",
+    "Access-Control-Allow-Methods": "POST,OPTIONS",
+}
 
 comprehend = boto3.client("comprehend", region_name=REGION_NAME)
 rekognition = boto3.client("rekognition", region_name=REGION_NAME)
@@ -19,9 +33,21 @@ rekognition = boto3.client("rekognition", region_name=REGION_NAME)
 def _response(status_code, body):
     return {
         "statusCode": status_code,
-        "headers": {"Content-Type": "application/json"},
+        "headers": CORS_HEADERS,
         "body": json.dumps(body, ensure_ascii=False),
     }
+
+
+def _parse_number(payload, key, default, cast, minimum, maximum):
+    """Read a numeric option from the body, falling back to the env default."""
+    raw = payload.get(key, default)
+    try:
+        value = cast(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be a number (got {raw!r})")
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{key} must be between {minimum} and {maximum}")
+    return value
 
 
 def _parse_body(event):
@@ -42,6 +68,7 @@ def _parse_body(event):
 
 
 def analyze_text(event, context):
+    """POST /ai/text/analyze — sentiment + entities (+ optional PII) via Amazon Comprehend."""
     try:
         payload = _parse_body(event)
     except (ValueError, json.JSONDecodeError) as exc:
@@ -111,17 +138,22 @@ def analyze_text(event, context):
 
 
 def detect_image_labels(event, context):
+    """POST /ai/image/labels — label detection via Amazon Rekognition (S3 object or base64 bytes)."""
     try:
         payload = _parse_body(event)
         image = _build_rekognition_image(payload)
+        max_labels = _parse_number(payload, "max_labels", REKOGNITION_MAX_LABELS, int, 1, 1000)
+        min_confidence = _parse_number(
+            payload, "min_confidence", REKOGNITION_MIN_CONFIDENCE, float, 0, 100
+        )
     except (ValueError, json.JSONDecodeError) as exc:
         return _response(400, {"message": str(exc)})
 
     try:
         result = rekognition.detect_labels(
             Image=image,
-            MaxLabels=int(payload.get("max_labels", REKOGNITION_MAX_LABELS)),
-            MinConfidence=float(payload.get("min_confidence", REKOGNITION_MIN_CONFIDENCE)),
+            MaxLabels=max_labels,
+            MinConfidence=min_confidence,
         )
     except (BotoCoreError, ClientError) as exc:
         return _response(502, {"message": "Rekognition request failed", "detail": str(exc)})
@@ -151,7 +183,10 @@ def detect_image_labels(event, context):
 def _build_rekognition_image(payload):
     image_bytes_base64 = payload.get("image_bytes_base64")
     if image_bytes_base64:
-        return {"Bytes": base64.b64decode(image_bytes_base64)}
+        try:
+            return {"Bytes": base64.b64decode(image_bytes_base64, validate=True)}
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"image_bytes_base64 is not valid base64: {exc}")
 
     s3_bucket = payload.get("s3_bucket")
     s3_key = payload.get("s3_key")

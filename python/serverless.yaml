@@ -1,12 +1,21 @@
 service: hello-api-python
 
+frameworkVersion: "3"
+# Serverless 3.x schema does not list python3.12 yet (runtime is valid on AWS)
+configValidationMode: warn
+
 provider:
   name: aws
   runtime: python3.12
   region: ap-northeast-2
   stage: ${opt:stage, 'dev'}
   environment:
-    AUTH_TOKEN: edumgt-secret-token
+    # Token is read from the AUTH_TOKEN env var at deploy time, falling back to
+    # SSM Parameter Store. It is never stored in this file.
+    #   export AUTH_TOKEN=...                       (local deploy)
+    #   aws ssm put-parameter --name /hello-api-python/dev/auth-token \
+    #       --type SecureString --value '...'       (shared / CI deploy)
+    AUTH_TOKEN: ${env:AUTH_TOKEN, ssm:/hello-api-python/${sls:stage}/auth-token}
     AI_DEFAULT_LANGUAGE: ko
     REKOGNITION_MAX_LABELS: 10
     REKOGNITION_MIN_CONFIDENCE: 80
@@ -20,6 +29,18 @@ provider:
             - comprehend:DetectPiiEntities
             - rekognition:DetectLabels
           Resource: "*"
+        # Rekognition reads the S3 object with the *caller's* (this Lambda's) role,
+        # so GetObject is required for the s3_bucket / s3_key request form.
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+          Resource: "arn:aws:s3:::*/*"
+
+package:
+  patterns:
+    - "!events/**"
+    - "!**/__pycache__/**"
+    - "!*.md"
 
 functions:
   hello:
@@ -33,23 +54,53 @@ functions:
   aiTextAnalyze:
     handler: ai_handler.analyze_text
     description: "Analyze text with Amazon Comprehend"
+    timeout: 15
     events:
       - http:
           path: ai/text/analyze
           method: post
           cors: true
+          authorizer: &tokenAuthorizer
+            name: authorizer
+            type: token
+            identitySource: method.request.header.Authorization
+            resultTtlInSeconds: 300
 
   aiImageLabels:
     handler: ai_handler.detect_image_labels
     description: "Detect labels with Amazon Rekognition"
+    timeout: 15
     events:
       - http:
           path: ai/image/labels
           method: post
           cors: true
+          authorizer: *tokenAuthorizer
 
   authorizer:
     handler: authorizer.authorize
-    description: "TOKEN Authorizer for users REST API (oir11z21f5)"
-    environment:
-      AUTH_TOKEN: edumgt-secret-token
+    description: "TOKEN Authorizer (Bearer AUTH_TOKEN) for the AI endpoints; reusable by the users REST API"
+
+resources:
+  Resources:
+    # When the Authorizer denies a request API Gateway answers *before* Lambda runs,
+    # so the CORS headers below must be added here or browsers report a CORS error
+    # instead of the real 401/403.
+    GatewayResponseDefault4XX:
+      Type: AWS::ApiGateway::GatewayResponse
+      Properties:
+        ResponseType: DEFAULT_4XX
+        RestApiId:
+          Ref: ApiGatewayRestApi
+        ResponseParameters:
+          gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+          gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+    GatewayResponseDefault5XX:
+      Type: AWS::ApiGateway::GatewayResponse
+      Properties:
+        ResponseType: DEFAULT_5XX
+        RestApiId:
+          Ref: ApiGatewayRestApi
+        ResponseParameters:
+          gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+          gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"

@@ -11,3 +11,4 @@ node_modules/
 .serverless/
 *.zip
 *.pem
+__pycache__/

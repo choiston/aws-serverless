@@ -1400,13 +1400,24 @@ functions:
 ```python
 import json
 
+CORS_HEADERS = {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type,Authorization",
+    "Access-Control-Allow-Methods": "GET,OPTIONS",
+}
+
+
 def hello(event, context):
+    """AWS Lambda handler for a simple Hello World HTTP endpoint."""
     query_params = event.get("queryStringParameters") or {}
     name = query_params.get("name", "World")
+
     body = {"message": f"Hello, {name}!", "language": "Python"}
+
     return {
         "statusCode": 200,
-        "headers": {"Content-Type": "application/json"},
+        "headers": CORS_HEADERS,   # 브라우저 호출을 위해 CORS 헤더 포함
         "body": json.dumps(body),
     }
 ```
@@ -1454,10 +1465,13 @@ aws lambda invoke \
 
 ```bash
 cd python
-serverless deploy
+
+# 인증 토큰은 파일에 저장하지 않고 배포 시점에 주입합니다 (아래 "인증 토큰 설정" 참고)
+export AUTH_TOKEN='<your-secret-token>'
+serverless deploy --stage dev
 ```
 
-`python/serverless.yaml`:
+`python/serverless.yaml` 핵심 구성:
 
 ```yaml
 service: hello-api-python
@@ -1468,6 +1482,8 @@ provider:
   region: ap-northeast-2
   stage: ${opt:stage, 'dev'}
   environment:
+    # 환경 변수 → SSM Parameter Store 순으로 조회. 파일에는 토큰을 적지 않음
+    AUTH_TOKEN: ${env:AUTH_TOKEN, ssm:/hello-api-python/${sls:stage}/auth-token}
     AI_DEFAULT_LANGUAGE: ko
   iam:
     role:
@@ -1479,16 +1495,66 @@ provider:
             - comprehend:DetectPiiEntities
             - rekognition:DetectLabels
           Resource: "*"
+        - Effect: Allow            # Rekognition이 S3 객체를 읽을 때 필요
+          Action: [s3:GetObject]
+          Resource: "arn:aws:s3:::*/*"
 
 functions:
-  hello:
+  hello:                            # 공개 엔드포인트
     handler: handler.hello
     events:
+      - http: { path: hello, method: get, cors: true }
+
+  aiTextAnalyze:                    # Authorizer로 보호되는 엔드포인트
+    handler: ai_handler.analyze_text
+    events:
       - http:
-          path: hello
-          method: get
+          path: ai/text/analyze
+          method: post
           cors: true
+          authorizer:
+            name: authorizer
+            type: token
+            identitySource: method.request.header.Authorization
+            resultTtlInSeconds: 300
+
+  authorizer:                       # Bearer 토큰 검사 Lambda
+    handler: authorizer.authorize
+
+resources:
+  Resources:
+    # Authorizer가 거부하면 Lambda 실행 전에 API Gateway가 401/403을 돌려주므로
+    # 이 응답에도 CORS 헤더를 붙여야 브라우저에서 진짜 오류 코드를 볼 수 있음
+    GatewayResponseDefault4XX:
+      Type: AWS::ApiGateway::GatewayResponse
+      Properties:
+        ResponseType: DEFAULT_4XX
+        RestApiId: { Ref: ApiGatewayRestApi }
+        ResponseParameters:
+          gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+          gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
 ```
+
+#### 인증 토큰 설정
+
+`AUTH_TOKEN`은 저장소에 커밋되지 않습니다. 두 방법 중 하나로 주입합니다.
+
+| 방법 | 명령 | 용도 |
+| ---- | ---- | ---- |
+| 환경 변수 | `export AUTH_TOKEN='...'` 후 `serverless deploy` | 로컬 실습 |
+| SSM Parameter Store | `aws ssm put-parameter --name /hello-api-python/dev/auth-token --type SecureString --value '...'` | 팀 공유·CI 배포. 환경 변수가 없을 때 자동 조회 |
+
+토큰이 어느 쪽에도 없으면 배포가 실패하고, Lambda에 환경 변수가 비어 있으면 Authorizer는 모든 요청을 거부합니다.
+
+#### 엔드포인트별 보호 여부
+
+| 엔드포인트 | 인증 | 필요한 헤더 |
+| ---- | ---- | ---- |
+| `GET /hello` | 없음 | — |
+| `POST /ai/text/analyze` | TOKEN Authorizer | `Authorization: Bearer <AUTH_TOKEN>` |
+| `POST /ai/image/labels` | TOKEN Authorizer | `Authorization: Bearer <AUTH_TOKEN>` |
+
+같은 `authorizer` 함수를 Node.js users API(`nodejs/serverless.yaml`)에도 콘솔이나 CLI로 붙일 수 있습니다. 정책의 리소스가 `api-id/*` 와일드카드이므로 한 번 캐시된 결과가 그 API의 모든 라우트에 재사용됩니다.
 
 ### AWS AI 리소스 연동 예제
 
@@ -1505,7 +1571,11 @@ functions:
 - [`python/events/ai-text-event.json`](python/events/ai-text-event.json)
 - [`python/events/ai-image-event.json`](python/events/ai-image-event.json)
 
-`python/serverless.yaml`에는 두 AI API에 필요한 IAM 권한도 함께 선언되어 있으므로, 별도 콘솔 작업 없이 `serverless deploy`로 바로 배포할 수 있습니다.
+`python/serverless.yaml`에는 두 AI API에 필요한 IAM 권한(Comprehend, Rekognition, S3 읽기)과 TOKEN Authorizer가 함께 선언되어 있으므로, 별도 콘솔 작업 없이 `serverless deploy`로 바로 배포할 수 있습니다. 두 AI 엔드포인트는 `Authorization: Bearer <AUTH_TOKEN>` 헤더가 없으면 `401 Unauthorized`를 반환합니다.
+
+> ⚠️ **PII 탐지 언어 제한**: Comprehend `DetectPiiEntities`는 영어(`en`)와 스페인어(`es`)만 지원합니다. 기본 언어가 `ko`이므로 `detect_pii: true`를 쓸 때는 `language_code: "en"`을 함께 보내야 하며, 그렇지 않으면 `pii_warning` 필드만 반환됩니다.
+
+> 💡 잘못된 입력(`max_labels`에 문자 등)은 `400`, AWS 서비스 호출 실패는 `502`로 구분해 반환합니다. 모든 응답에 CORS 헤더가 포함되어 브라우저에서 직접 호출할 수 있습니다.
 
 ```bash
 cd python
@@ -1518,6 +1588,7 @@ serverless info
 ```bash
 curl -X POST https://<api-id>.execute-api.ap-northeast-2.amazonaws.com/dev/ai/text/analyze \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $AUTH_TOKEN" \
   -d '{
     "text": "John Smith from Seattle said the Lambda rollout was smooth and shared john@example.com for follow-up.",
     "language_code": "en",
@@ -1540,6 +1611,7 @@ aws lambda invoke \
 ```bash
 curl -X POST https://<api-id>.execute-api.ap-northeast-2.amazonaws.com/dev/ai/image/labels \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $AUTH_TOKEN" \
   -d '{
     "s3_bucket": "replace-with-your-bucket",
     "s3_key": "images/sample.png",
@@ -1940,6 +2012,49 @@ GitHub 레포지터리 → **Actions** 탭에서 실행 결과를 확인할 수 
 ---
 
 ## 권한 오류 해결 가이드
+
+### Serverless Framework 배포용 IAM 정책 (Python 서비스)
+
+`serverless deploy`는 CloudFormation을 통해 Lambda · API Gateway · IAM 역할 · S3 배포 버킷 · CloudWatch Logs를 한꺼번에 만들기 때문에, `s3-user`처럼 단일 서비스 권한만 있는 사용자로는 첫 단계인 `cloudformation:DescribeStacks`에서 바로 실패합니다.
+
+[`docs/iam/serverless-deploy-hello-api-python.json`](docs/iam/serverless-deploy-hello-api-python.json)에 `hello-api-python` 서비스 배포에 필요한 최소 권한을 정리해 두었습니다. 리소스 ARN이 `hello-api-python-*` 접두어로 제한되어 있어 다른 스택에는 영향을 주지 않습니다.
+
+| Sid | 대상 | 이유 |
+| ---- | ---- | ---- |
+| `CloudFormationStack` | `stack/hello-api-python-*` | 스택 생성·변경·삭제, 배포 진행 상황 폴링 |
+| `DeploymentBucket` | `hello-api-python-*-serverlessdeploymentbucket-*` | 코드 ZIP과 템플릿을 올리는 배포 버킷 생성·업로드 |
+| `LambdaFunctions` | `function:hello-api-python-*` | 함수 4개 생성·코드 갱신·API Gateway 호출 권한 부여 |
+| `LambdaExecutionRole` / `PassLambdaExecutionRole` | `role/hello-api-python-*-lambdaRole` | Lambda 실행 역할 생성과 Lambda 서비스에만 전달 허용 |
+| `ApiGateway` | `/restapis`, `/restapis/*`, `/tags/*` | REST API·리소스·메서드·Authorizer·Gateway Response·스테이지 생성 |
+| `CloudWatchLogGroups` | `/aws/lambda/hello-api-python-*` | 함수별 로그 그룹 생성 |
+| `AuthTokenParameter` / `DecryptSecureStringParameter` | `parameter/hello-api-python/*` | `${ssm:...}` 변수 해석과 SecureString 복호화, 토큰 최초 등록 |
+| `InvokeForTesting` | `function:hello-api-python-*` | `sls invoke`, `aws lambda invoke` 로 배포 확인 |
+
+적용 방법 (관리자 권한 자격 증명으로 실행):
+
+```bash
+# ① 배포 전용 사용자 생성 (기존 s3-user에 붙여도 되지만 역할 분리를 권장)
+aws iam create-user --user-name sls-deploy-python
+
+# ② 정책 생성 후 연결
+aws iam create-policy \
+  --policy-name ServerlessDeployHelloApiPython \
+  --policy-document file://docs/iam/serverless-deploy-hello-api-python.json
+aws iam attach-user-policy \
+  --user-name sls-deploy-python \
+  --policy-arn arn:aws:iam::086015456585:policy/ServerlessDeployHelloApiPython
+
+# ③ 액세스 키 발급 → 로컬 프로필로 등록
+aws iam create-access-key --user-name sls-deploy-python
+aws configure --profile sls-deploy-python
+
+# ④ 해당 프로필로 배포
+cd python
+export AUTH_TOKEN='<your-secret-token>'
+serverless deploy --stage dev --aws-profile sls-deploy-python
+```
+
+> 다른 계정에서 쓰려면 JSON 안의 계정 ID `086015456585`와 리전 `ap-northeast-2`를 바꿔야 합니다. 정책 크기는 관리형 정책 한도(6,144자) 안이므로 그대로 `create-policy`에 넣을 수 있습니다.
 
 ### CloudFormation 권한 오류
 
